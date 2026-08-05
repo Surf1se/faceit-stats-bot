@@ -687,9 +687,6 @@ int main(int argc, char* argv[])
         }
 
         double kdSum = 0.0;
-        double eloChangeSum = 0.0;
-
-        bool everyMatchHasEloChange = true;
 
         for (
             const MatchInfo& match :
@@ -697,16 +694,6 @@ int main(int argc, char* argv[])
         )
         {
             kdSum += match.kd;
-
-            if (match.eloChange.has_value())
-            {
-                eloChangeSum +=
-                    match.eloChange.value();
-            }
-            else
-            {
-                everyMatchHasEloChange = false;
-            }
         }
 
         const double averageKd =
@@ -714,117 +701,6 @@ int main(int argc, char* argv[])
             static_cast<double>(
                 sessionMatches.size()
             );
-
-        int totalEloChange = 0;
-
-        if (everyMatchHasEloChange)
-        {
-            totalEloChange =
-                static_cast<int>(
-                    round(eloChangeSum)
-                );
-        }
-        else
-        {
-            /*
-             * Если FACEIT не вернул изменение ELO
-             * для каждого матча, считаем изменение
-             * по рейтингу до начала сессии.
-             *
-             * Матч сразу перед сессией хранит ELO,
-             * которое было у игрока перед самым
-             * старым матчем выбранной сессии.
-             * Поэтому стрелка самого старого матча
-             * теперь тоже входит в итог.
-             */
-            optional<int> startingElo;
-
-            const size_t matchBeforeSessionIndex =
-                sessionMatches.size();
-
-            if (
-                matchBeforeSessionIndex <
-                allMatches.size()
-            )
-            {
-                const MatchInfo& matchBeforeSession =
-                    allMatches.at(
-                        matchBeforeSessionIndex
-                    );
-
-                if (!matchBeforeSession.matchId.empty())
-                {
-                    const string matchUrl =
-                        "https://www.faceit.com/api/stats/v3/matches/" +
-                        matchBeforeSession.matchId;
-
-                    const json matchData =
-                        getJson(
-                            matchUrl,
-                            false
-                        );
-
-                    startingElo =
-                        findPlayerEloInMatch(
-                            matchData,
-                            playerId
-                        );
-                }
-            }
-
-            /*
-             * Резервный вариант для случая, когда
-             * среди загруженных матчей нет матча
-             * перед сессией, но известна стрелка
-             * самого старого матча.
-             */
-            if (!startingElo.has_value())
-            {
-                const MatchInfo& oldestSessionMatch =
-                    sessionMatches.back();
-
-                if (
-                    oldestSessionMatch.matchId.empty() ||
-                    !oldestSessionMatch.eloChange.has_value()
-                )
-                {
-                    throw runtime_error(
-                        "Не удалось определить ELO "
-                        "до первого матча сессии."
-                    );
-                }
-
-                const string matchUrl =
-                    "https://www.faceit.com/api/stats/v3/matches/" +
-                    oldestSessionMatch.matchId;
-
-                const json matchData =
-                    getJson(
-                        matchUrl,
-                        false
-                    );
-
-                const int eloAfterOldestMatch =
-                    findPlayerEloInMatch(
-                        matchData,
-                        playerId
-                    );
-
-                startingElo =
-                    eloAfterOldestMatch -
-                    static_cast<int>(
-                        round(
-                            oldestSessionMatch
-                                .eloChange
-                                .value()
-                        )
-                    );
-            }
-
-            totalEloChange =
-                currentElo -
-                startingElo.value();
-        }
 
         const MatchInfo& newestMatch =
             sessionMatches.front();
@@ -859,15 +735,13 @@ int main(int argc, char* argv[])
             << '\n';
 
         cout
-            << "Изменение ELO: ";
-
-        if (totalEloChange > 0)
-        {
-            cout << "+";
-        }
+            << "Текущее ELO: "
+            << currentElo
+            << '\n';
 
         cout
-            << totalEloChange
+            << "Изменение ELO за сессию: "
+            << "недоступно"
             << endl;
     }
     catch (const json::exception& error)
