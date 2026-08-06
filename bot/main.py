@@ -1,6 +1,8 @@
 import asyncio
+import logging
 import os
 import sqlite3
+import time
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -8,21 +10,36 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import BotCommand, Message
 from dotenv import load_dotenv
 
-from faceit_stats import FaceitStatsError, collect_faceit_stats
+from faceit_stats import (
+    FaceitStatsError,
+    SessionStats,
+    collect_faceit_session,
+    format_session_stats,
+)
 
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 BOT_DIR = Path(__file__).resolve().parent
 ENV_PATH = PROJECT_DIR / ".env"
 
-# Сначала загружаем локальный .env.
-# На Railway переменные уже находятся в окружении.
 load_dotenv(ENV_PATH)
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 FACEIT_API_KEY = os.getenv("FACEIT_API_KEY", "").strip()
 
-# Railway создаёт эту переменную после подключения Volume.
+try:
+    ELO_TRACKING_INTERVAL_SECONDS = max(
+        60,
+        int(
+            os.getenv(
+                "ELO_TRACKING_INTERVAL_SECONDS",
+                "900",
+            )
+        ),
+    )
+except ValueError:
+    ELO_TRACKING_INTERVAL_SECONDS = 900
+
 volume_mount_path = os.getenv(
     "RAILWAY_VOLUME_MOUNT_PATH",
     "",
@@ -41,20 +58,37 @@ DATABASE_PATH = Path(
     )
 )
 
+logging.basicConfig(
+    level=logging.INFO,
+    format=(
+        "%(asctime)s | %(levelname)s | "
+        "%(name)s | %(message)s"
+    ),
+)
+
+logger = logging.getLogger("faceit-bot")
 router = Router()
 
-# Telegram ID пользователей, у которых бот ожидает ник.
 waiting_for_nickname: set[int] = set()
 
 
+def open_database() -> sqlite3.Connection:
+    connection = sqlite3.connect(
+        DATABASE_PATH,
+        timeout=30,
+    )
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
 def init_database() -> None:
-    """Создаёт папку и таблицу пользователей."""
+    """Создаёт базу и таблицы для пользователей и снимков ELO."""
     DATABASE_PATH.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with open_database() as connection:
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -63,27 +97,88 @@ def init_database() -> None:
             )
             """
         )
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS elo_snapshots (
+                telegram_id INTEGER NOT NULL,
+                faceit_nickname TEXT NOT NULL,
+                match_id TEXT NOT NULL,
+                match_finished_at INTEGER NOT NULL,
+                elo INTEGER NOT NULL,
+                recorded_at INTEGER NOT NULL,
+                PRIMARY KEY (telegram_id, match_id)
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+                idx_elo_snapshots_user_time
+            ON elo_snapshots (
+                telegram_id,
+                match_finished_at
+            )
+            """
+        )
+
         connection.commit()
 
 
 def save_nickname(telegram_id: int, nickname: str) -> None:
-    """Сохраняет или обновляет FACEIT-ник."""
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    """
+    Сохраняет ник. Если пользователь сменил ник,
+    старые снимки ELO очищаются.
+    """
+    with open_database() as connection:
+        current_row = connection.execute(
+            """
+            SELECT faceit_nickname
+            FROM users
+            WHERE telegram_id = ?
+            """,
+            (telegram_id,),
+        ).fetchone()
+
+        current_nickname = (
+            current_row["faceit_nickname"]
+            if current_row
+            else None
+        )
+
         connection.execute(
             """
-            INSERT INTO users (telegram_id, faceit_nickname)
+            INSERT INTO users (
+                telegram_id,
+                faceit_nickname
+            )
             VALUES (?, ?)
             ON CONFLICT(telegram_id)
-            DO UPDATE SET faceit_nickname = excluded.faceit_nickname
+            DO UPDATE SET
+                faceit_nickname = excluded.faceit_nickname
             """,
             (telegram_id, nickname),
         )
+
+        if (
+            current_nickname is not None
+            and current_nickname.casefold()
+            != nickname.casefold()
+        ):
+            connection.execute(
+                """
+                DELETE FROM elo_snapshots
+                WHERE telegram_id = ?
+                """,
+                (telegram_id,),
+            )
+
         connection.commit()
 
 
 def get_nickname(telegram_id: int) -> str | None:
-    """Возвращает сохранённый FACEIT-ник."""
-    with sqlite3.connect(DATABASE_PATH) as connection:
+    with open_database() as connection:
         row = connection.execute(
             """
             SELECT faceit_nickname
@@ -93,7 +188,110 @@ def get_nickname(telegram_id: int) -> str | None:
             (telegram_id,),
         ).fetchone()
 
-    return row[0] if row else None
+    return row["faceit_nickname"] if row else None
+
+
+def get_all_users() -> list[tuple[int, str]]:
+    with open_database() as connection:
+        rows = connection.execute(
+            """
+            SELECT telegram_id, faceit_nickname
+            FROM users
+            ORDER BY telegram_id
+            """
+        ).fetchall()
+
+    return [
+        (
+            int(row["telegram_id"]),
+            str(row["faceit_nickname"]),
+        )
+        for row in rows
+    ]
+
+
+def save_latest_elo_snapshot(
+    telegram_id: int,
+    session: SessionStats,
+) -> None:
+    """
+    Связывает текущее ELO с последним завершённым матчем.
+    Повторная проверка обновит значение, если FACEIT
+    применил изменение рейтинга с небольшой задержкой.
+    """
+    latest_match = session.newest_match
+
+    with open_database() as connection:
+        connection.execute(
+            """
+            INSERT INTO elo_snapshots (
+                telegram_id,
+                faceit_nickname,
+                match_id,
+                match_finished_at,
+                elo,
+                recorded_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(telegram_id, match_id)
+            DO UPDATE SET
+                faceit_nickname = excluded.faceit_nickname,
+                match_finished_at = excluded.match_finished_at,
+                elo = excluded.elo,
+                recorded_at = excluded.recorded_at
+            """,
+            (
+                telegram_id,
+                session.nickname,
+                latest_match.match_id,
+                latest_match.timestamp_seconds,
+                session.current_elo,
+                int(time.time()),
+            ),
+        )
+        connection.commit()
+
+
+def get_snapshot_elo(
+    telegram_id: int,
+    match_id: str,
+) -> int | None:
+    with open_database() as connection:
+        row = connection.execute(
+            """
+            SELECT elo
+            FROM elo_snapshots
+            WHERE telegram_id = ?
+              AND match_id = ?
+            """,
+            (telegram_id, match_id),
+        ).fetchone()
+
+    return int(row["elo"]) if row else None
+
+
+def calculate_session_elo_change(
+    telegram_id: int,
+    session: SessionStats,
+) -> int | None:
+    """
+    Сравнивает текущее ELO с ELO после матча,
+    который был непосредственно перед новой сессией.
+    """
+    previous_match = session.previous_match
+
+    if previous_match is None:
+        return None
+
+    previous_elo = get_snapshot_elo(
+        telegram_id,
+        previous_match.match_id,
+    )
+
+    if previous_elo is None:
+        return None
+
+    return session.current_elo - previous_elo
 
 
 def normalize_nickname(raw_nickname: str) -> str:
@@ -117,13 +315,100 @@ def validate_nickname(nickname: str) -> str | None:
 
 
 def limit_error_text(text: str, limit: int = 1500) -> str:
-    """Не даёт огромному ответу API сломать сообщение Telegram."""
     normalized = " ".join(text.split())
 
     if len(normalized) <= limit:
         return normalized
 
     return normalized[:limit] + "…"
+
+
+async def fetch_and_store_session(
+    telegram_id: int,
+    nickname: str,
+) -> SessionStats:
+    session = await asyncio.to_thread(
+        collect_faceit_session,
+        nickname,
+        FACEIT_API_KEY,
+    )
+
+    await asyncio.to_thread(
+        save_latest_elo_snapshot,
+        telegram_id,
+        session,
+    )
+
+    return session
+
+
+async def track_single_user(
+    telegram_id: int,
+    nickname: str,
+) -> None:
+    try:
+        session = await asyncio.wait_for(
+            fetch_and_store_session(
+                telegram_id,
+                nickname,
+            ),
+            timeout=75,
+        )
+    except Exception as error:
+        logger.warning(
+            "Не удалось обновить ELO для %s: %s",
+            nickname,
+            limit_error_text(str(error), 300),
+        )
+        return
+
+    logger.info(
+        "ELO зафиксировано: user=%s nickname=%s "
+        "match=%s elo=%s",
+        telegram_id,
+        nickname,
+        session.newest_match.match_id,
+        session.current_elo,
+    )
+
+
+async def elo_tracking_loop() -> None:
+    """
+    Раз в 15 минут проверяет всех сохранённых игроков.
+    Интервал можно изменить переменной
+    ELO_TRACKING_INTERVAL_SECONDS.
+    """
+    await asyncio.sleep(5)
+
+    while True:
+        cycle_started_at = asyncio.get_running_loop().time()
+        users = await asyncio.to_thread(get_all_users)
+
+        logger.info(
+            "Запуск фоновой проверки ELO. Пользователей: %s",
+            len(users),
+        )
+
+        for telegram_id, nickname in users:
+            await track_single_user(
+                telegram_id,
+                nickname,
+            )
+
+            # Небольшая пауза между игроками,
+            # чтобы не отправлять API-запросы одновременно.
+            await asyncio.sleep(1)
+
+        elapsed = (
+            asyncio.get_running_loop().time()
+            - cycle_started_at
+        )
+        sleep_seconds = max(
+            30,
+            ELO_TRACKING_INTERVAL_SECONDS - elapsed,
+        )
+
+        await asyncio.sleep(sleep_seconds)
 
 
 @router.message(CommandStart())
@@ -160,10 +445,11 @@ async def stats_handler(message: Message) -> None:
     if message.from_user is None:
         return
 
-    nickname = get_nickname(message.from_user.id)
+    telegram_id = message.from_user.id
+    nickname = get_nickname(telegram_id)
 
     if nickname is None:
-        waiting_for_nickname.add(message.from_user.id)
+        waiting_for_nickname.add(telegram_id)
         await message.answer(
             "Сначала отправь свой ник FACEIT."
         )
@@ -174,14 +460,24 @@ async def stats_handler(message: Message) -> None:
     )
 
     try:
-        output = await asyncio.wait_for(
-            asyncio.to_thread(
-                collect_faceit_stats,
+        session = await asyncio.wait_for(
+            fetch_and_store_session(
+                telegram_id,
                 nickname,
-                FACEIT_API_KEY,
             ),
             timeout=75,
         )
+
+        elo_change = await asyncio.to_thread(
+            calculate_session_elo_change,
+            telegram_id,
+            session,
+        )
+        output = format_session_stats(
+            session,
+            elo_change,
+        )
+
     except FaceitStatsError as error:
         await status_message.edit_text(
             "Не удалось получить статистику.\n\n"
@@ -193,6 +489,10 @@ async def stats_handler(message: Message) -> None:
             "Попробуй ещё раз через минуту."
         )
     except Exception as error:
+        logger.exception(
+            "Ошибка команды /stats для %s",
+            nickname,
+        )
         await status_message.edit_text(
             "Произошла непредвиденная ошибка.\n\n"
             + limit_error_text(str(error))
@@ -233,7 +533,16 @@ async def text_handler(message: Message) -> None:
 
     await message.answer(
         f"Ник {nickname} сохранён.\n"
+        "Отслеживание ELO включено.\n"
         "Теперь используй команду /stats."
+    )
+
+    # Не заставляем пользователя ждать ответа FACEIT.
+    asyncio.create_task(
+        track_single_user(
+            telegram_id,
+            nickname,
+        )
     )
 
 
@@ -271,7 +580,19 @@ async def main() -> None:
         ]
     )
 
-    await dispatcher.start_polling(bot)
+    tracking_task = asyncio.create_task(
+        elo_tracking_loop()
+    )
+
+    try:
+        await dispatcher.start_polling(bot)
+    finally:
+        tracking_task.cancel()
+
+        try:
+            await tracking_task
+        except asyncio.CancelledError:
+            pass
 
 
 if __name__ == "__main__":

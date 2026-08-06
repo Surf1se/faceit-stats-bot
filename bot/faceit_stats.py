@@ -22,8 +22,34 @@ class FaceitStatsError(RuntimeError):
 
 @dataclass(frozen=True)
 class MatchInfo:
+    match_id: str
     timestamp_seconds: int
     kd: float
+
+
+@dataclass(frozen=True)
+class SessionStats:
+    nickname: str
+    player_id: str
+    current_elo: int
+    all_matches: list[MatchInfo]
+    session_matches: list[MatchInfo]
+    previous_match: MatchInfo | None
+
+    @property
+    def newest_match(self) -> MatchInfo:
+        return self.session_matches[0]
+
+    @property
+    def oldest_match(self) -> MatchInfo:
+        return self.session_matches[-1]
+
+    @property
+    def average_kd(self) -> float:
+        return (
+            sum(match.kd for match in self.session_matches)
+            / len(self.session_matches)
+        )
 
 
 def _request_json(url: str, api_key: str) -> dict[str, Any]:
@@ -32,7 +58,7 @@ def _request_json(url: str, api_key: str) -> dict[str, Any]:
         headers={
             "Authorization": f"Bearer {api_key}",
             "Accept": "application/json",
-            "User-Agent": "FaceitStatsBot/2.0",
+            "User-Agent": "FaceitStatsBot/3.0",
         },
         method="GET",
     )
@@ -113,6 +139,19 @@ def _read_number(
     return None
 
 
+def _read_string(
+    values: dict[str, Any],
+    possible_names: tuple[str, ...],
+) -> str | None:
+    for name in possible_names:
+        value = values.get(name)
+
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    return None
+
+
 def _read_timestamp_seconds(stats: dict[str, Any]) -> int | None:
     raw_timestamp = _read_number(
         stats,
@@ -129,7 +168,6 @@ def _read_timestamp_seconds(stats: dict[str, Any]) -> int | None:
 
     timestamp = int(raw_timestamp)
 
-    # Некоторые источники могут вернуть миллисекунды.
     if timestamp >= 100_000_000_000:
         timestamp //= 1000
 
@@ -155,6 +193,24 @@ def _parse_matches(response: dict[str, Any]) -> list[MatchInfo]:
         if not isinstance(stats, dict):
             continue
 
+        match_id = _read_string(
+            stats,
+            (
+                "Match Id",
+                "Match ID",
+                "match_id",
+            ),
+        )
+
+        if match_id is None:
+            match_id = _read_string(
+                item,
+                (
+                    "match_id",
+                    "matchId",
+                ),
+            )
+
         kd = _read_number(
             stats,
             (
@@ -165,11 +221,16 @@ def _parse_matches(response: dict[str, Any]) -> list[MatchInfo]:
         )
         timestamp_seconds = _read_timestamp_seconds(stats)
 
-        if kd is None or timestamp_seconds is None:
+        if (
+            match_id is None
+            or kd is None
+            or timestamp_seconds is None
+        ):
             continue
 
         matches.append(
             MatchInfo(
+                match_id=match_id,
                 timestamp_seconds=timestamp_seconds,
                 kd=kd,
             )
@@ -230,18 +291,11 @@ def _format_datetime(timestamp_seconds: int) -> str:
     return value.strftime("%d.%m.%y %H:%M")
 
 
-def collect_faceit_stats(
+def collect_faceit_session(
     nickname: str,
     api_key: str,
-) -> str:
-    """
-    Получает статистику последней игровой сессии через
-    официальный FACEIT Data API.
-
-    Изменение ELO за уже сыгранную сессию не выводится,
-    потому что официальный API не возвращает историю
-    ELO по каждому матчу.
-    """
+) -> SessionStats:
+    """Получает профиль, последние матчи и текущую сессию."""
     clean_nickname = nickname.strip()
     clean_api_key = api_key.strip()
 
@@ -305,23 +359,50 @@ def collect_faceit_stats(
     all_matches = _parse_matches(stats_response)
     session_matches = _select_latest_session(all_matches)
 
-    average_kd = (
-        sum(match.kd for match in session_matches)
-        / len(session_matches)
+    previous_match_index = len(session_matches)
+    previous_match = (
+        all_matches[previous_match_index]
+        if previous_match_index < len(all_matches)
+        else None
     )
 
-    newest_match = session_matches[0]
-    oldest_match = session_matches[-1]
+    return SessionStats(
+        nickname=clean_nickname,
+        player_id=player_id,
+        current_elo=current_elo,
+        all_matches=all_matches,
+        session_matches=session_matches,
+        previous_match=previous_match,
+    )
+
+
+def format_session_stats(
+    session: SessionStats,
+    elo_change: int | None,
+) -> str:
+    """Формирует готовое сообщение для Telegram."""
+    if elo_change is None:
+        elo_line = (
+            "Изменение ELO за сессию: пока недоступно\n"
+            "Бот уже отслеживает ELO. Расчёт появится "
+            "после следующей новой сессии."
+        )
+    else:
+        elo_prefix = "+" if elo_change > 0 else ""
+        elo_line = (
+            "Изменение ELO за сессию: "
+            f"{elo_prefix}{elo_change}"
+        )
 
     return (
-        f"Игрок: {clean_nickname}\n"
+        f"Игрок: {session.nickname}\n"
         "Последняя игровая сессия:\n"
-        f"{_format_datetime(oldest_match.timestamp_seconds)}"
+        f"{_format_datetime(session.oldest_match.timestamp_seconds)}"
         " - "
-        f"{_format_datetime(newest_match.timestamp_seconds)}"
+        f"{_format_datetime(session.newest_match.timestamp_seconds)}"
         "\n\n"
-        f"Матчей: {len(session_matches)}\n"
-        f"Средний У/С: {average_kd:.2f}\n"
-        f"Текущее ELO: {current_elo}\n"
-        "Изменение ELO за сессию: недоступно"
+        f"Матчей: {len(session.session_matches)}\n"
+        f"Средний У/С: {session.average_kd:.2f}\n"
+        f"Текущее ELO: {session.current_elo}\n"
+        f"{elo_line}"
     )
