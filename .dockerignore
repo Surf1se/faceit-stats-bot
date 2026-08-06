@@ -10,5 +10,4 @@ __pycache__
 .idea
 .vscode
 bot/users.db
-scripts/stats.exe
-scripts/stats
+scripts/

@@ -1,7 +1,6 @@
 import asyncio
 import os
 import sqlite3
-import subprocess
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -9,30 +8,21 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import BotCommand, Message
 from dotenv import load_dotenv
 
+from faceit_stats import FaceitStatsError, collect_faceit_stats
 
-# Один и тот же код работает:
-# - локально в Windows через scripts/stats.exe;
-# - на Railway/Linux через scripts/stats.
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 BOT_DIR = Path(__file__).resolve().parent
 ENV_PATH = PROJECT_DIR / ".env"
 
-DEFAULT_STATS_PROGRAM = (
-    PROJECT_DIR / "scripts" / "stats.exe"
-    if os.name == "nt"
-    else PROJECT_DIR / "scripts" / "stats"
-)
+# Сначала загружаем локальный .env.
+# На Railway переменные уже находятся в окружении.
+load_dotenv(ENV_PATH)
 
-STATS_PROGRAM = Path(
-    os.getenv(
-        "STATS_PROGRAM_PATH",
-        str(DEFAULT_STATS_PROGRAM),
-    )
-)
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+FACEIT_API_KEY = os.getenv("FACEIT_API_KEY", "").strip()
 
-# Railway автоматически передаёт RAILWAY_VOLUME_MOUNT_PATH,
-# когда к сервису подключён постоянный Volume.
+# Railway создаёт эту переменную после подключения Volume.
 volume_mount_path = os.getenv(
     "RAILWAY_VOLUME_MOUNT_PATH",
     "",
@@ -51,20 +41,14 @@ DATABASE_PATH = Path(
     )
 )
 
-load_dotenv(ENV_PATH)
-
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-FACEIT_API_KEY = os.getenv("FACEIT_API_KEY", "").strip()
-
 router = Router()
 
-# Здесь находятся Telegram ID пользователей,
-# которым бот сейчас предложил ввести ник.
+# Telegram ID пользователей, у которых бот ожидает ник.
 waiting_for_nickname: set[int] = set()
 
 
 def init_database() -> None:
-    """Создаёт базу пользователей и папку для неё."""
+    """Создаёт папку и таблицу пользователей."""
     DATABASE_PATH.parent.mkdir(
         parents=True,
         exist_ok=True,
@@ -83,7 +67,7 @@ def init_database() -> None:
 
 
 def save_nickname(telegram_id: int, nickname: str) -> None:
-    """Сохраняет или обновляет FACEIT-ник пользователя."""
+    """Сохраняет или обновляет FACEIT-ник."""
     with sqlite3.connect(DATABASE_PATH) as connection:
         connection.execute(
             """
@@ -113,15 +97,10 @@ def get_nickname(telegram_id: int) -> str | None:
 
 
 def normalize_nickname(raw_nickname: str) -> str:
-    """
-    Убирает лишние пробелы.
-    FACEIT-ник передаётся в stats.exe отдельным аргументом.
-    """
     return raw_nickname.strip()
 
 
 def validate_nickname(nickname: str) -> str | None:
-    """Возвращает текст ошибки или None, если ник подходит."""
     if not nickname:
         return "Ник не может быть пустым."
 
@@ -137,59 +116,14 @@ def validate_nickname(nickname: str) -> str | None:
     return None
 
 
-def run_stats_program(nickname: str) -> tuple[bool, str]:
-    """
-    Запускает C++ программу:
-    Windows: scripts/stats.exe <nickname>
-    Linux:   scripts/stats <nickname>
+def limit_error_text(text: str, limit: int = 1500) -> str:
+    """Не даёт огромному ответу API сломать сообщение Telegram."""
+    normalized = " ".join(text.split())
 
-    Переменная FACEIT_API_KEY передаётся
-    дочернему процессу через окружение.
-    """
-    if not STATS_PROGRAM.exists():
-        return (
-            False,
-            f"Файл статистики не найден: {STATS_PROGRAM}",
-        )
+    if len(normalized) <= limit:
+        return normalized
 
-    environment = os.environ.copy()
-    environment["FACEIT_API_KEY"] = FACEIT_API_KEY
-
-    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-
-    try:
-        result = subprocess.run(
-            [str(STATS_PROGRAM), nickname],
-            cwd=PROJECT_DIR,
-            env=environment,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=90,
-            check=False,
-            creationflags=creation_flags,
-        )
-    except subprocess.TimeoutExpired:
-        return False, "FACEIT слишком долго отвечает. Попробуй ещё раз позже."
-    except OSError as error:
-        return False, f"Не удалось запустить программу статистики: {error}"
-
-    stdout = result.stdout.strip()
-    stderr = result.stderr.strip()
-
-    if result.returncode != 0:
-        error_text = (
-            stderr
-            or stdout
-            or "Неизвестная ошибка программы статистики."
-        )
-        return False, error_text
-
-    if not stdout:
-        return False, "Программа статистики завершилась без результата."
-
-    return True, stdout
+    return normalized[:limit] + "…"
 
 
 @router.message(CommandStart())
@@ -198,7 +132,6 @@ async def start_handler(message: Message) -> None:
         return
 
     waiting_for_nickname.add(message.from_user.id)
-
     current_nickname = get_nickname(message.from_user.id)
 
     if current_nickname:
@@ -240,18 +173,32 @@ async def stats_handler(message: Message) -> None:
         f"Собираю статистику игрока {nickname}..."
     )
 
-    success, output = await asyncio.to_thread(
-        run_stats_program,
-        nickname,
-    )
-
-    if success:
-        await status_message.edit_text(output)
-    else:
+    try:
+        output = await asyncio.wait_for(
+            asyncio.to_thread(
+                collect_faceit_stats,
+                nickname,
+                FACEIT_API_KEY,
+            ),
+            timeout=75,
+        )
+    except FaceitStatsError as error:
         await status_message.edit_text(
             "Не удалось получить статистику.\n\n"
-            f"{output}"
+            + limit_error_text(str(error))
         )
+    except asyncio.TimeoutError:
+        await status_message.edit_text(
+            "FACEIT слишком долго отвечает. "
+            "Попробуй ещё раз через минуту."
+        )
+    except Exception as error:
+        await status_message.edit_text(
+            "Произошла непредвиденная ошибка.\n\n"
+            + limit_error_text(str(error))
+        )
+    else:
+        await status_message.edit_text(output)
 
 
 @router.message(F.text)
@@ -259,7 +206,6 @@ async def text_handler(message: Message) -> None:
     if message.from_user is None or message.text is None:
         return
 
-    # Команды обрабатываются отдельными обработчиками.
     if message.text.startswith("/"):
         return
 
@@ -294,12 +240,12 @@ async def text_handler(message: Message) -> None:
 async def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError(
-            "В файле .env не задан TELEGRAM_BOT_TOKEN."
+            "Не задан TELEGRAM_BOT_TOKEN."
         )
 
     if not FACEIT_API_KEY:
         raise RuntimeError(
-            "В файле .env не задан FACEIT_API_KEY."
+            "Не задан FACEIT_API_KEY."
         )
 
     init_database()
