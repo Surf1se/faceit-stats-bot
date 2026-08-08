@@ -381,6 +381,13 @@ def format_session_stats(
     elo_change: int | None,
 ) -> str:
     """Формирует готовое сообщение для Telegram."""
+    if session.average_kd > 1:
+        kd_marker = "🟢"
+    elif session.average_kd < 1:
+        kd_marker = "🔴"
+    else:
+        kd_marker = "⚪"
+
     if elo_change is None:
         elo_line = (
             "Изменение ELO за сессию: пока недоступно\n"
@@ -388,10 +395,17 @@ def format_session_stats(
             "после следующей новой сессии."
         )
     else:
+        if elo_change > 0:
+            elo_marker = "🟢"
+        elif elo_change < 0:
+            elo_marker = "🔴"
+        else:
+            elo_marker = "⚪"
+
         elo_prefix = "+" if elo_change > 0 else ""
         elo_line = (
             "Изменение ELO за сессию: "
-            f"{elo_prefix}{elo_change}"
+            f"{elo_prefix}{elo_change} {elo_marker}"
         )
 
     return (
@@ -402,7 +416,7 @@ def format_session_stats(
         f"{_format_datetime(session.newest_match.timestamp_seconds)}"
         "\n\n"
         f"Матчей: {len(session.session_matches)}\n"
-        f"Средний У/С: {session.average_kd:.2f}\n"
+        f"Средний У/С: {session.average_kd:.2f} {kd_marker}\n"
         f"Текущее ELO: {session.current_elo}\n"
         f"{elo_line}"
     )
