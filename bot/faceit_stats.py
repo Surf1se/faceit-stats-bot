@@ -418,5 +418,6 @@ def format_session_stats(
         f"Матчей: {len(session.session_matches)}\n"
         f"Средний У/С: {session.average_kd:.2f} {kd_marker}\n"
         f"Текущее ELO: {session.current_elo}\n"
-        f"{elo_line}"
+        f"{elo_line}\n\n"
+        "/commands — команды"
     )

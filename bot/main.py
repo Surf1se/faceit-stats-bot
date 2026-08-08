@@ -634,14 +634,14 @@ async def start_handler(message: Message) -> None:
         )
 
 
-@router.message(Command("help"))
-async def help_handler(message: Message) -> None:
+@router.message(Command("commands"))
+async def commands_handler(message: Message) -> None:
     await message.answer(
-        "Доступные команды:\n\n"
-        "/start — указать или изменить ник FACEIT\n"
-        "/stats — показать статистику последней сессии\n"
-        "/leaderboard — топ-10 лучших сессий по ELO\n"
-        "/help — показать список команд"
+        "📋 Команды бота\n\n"
+        "/stats — статистика последней игровой сессии\n"
+        "/leaderboard — лидерборд лучших сессий\n"
+        "/start — указать или изменить FACEIT-ник\n"
+        "/commands — список команд"
     )
 
 
@@ -803,8 +803,8 @@ async def main() -> None:
                 description="Топ-10 лучших сессий по ELO",
             ),
             BotCommand(
-                command="help",
-                description="Доступные команды",
+                command="commands",
+                description="Команды",
             ),
         ]
     )
