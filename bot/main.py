@@ -662,7 +662,7 @@ def format_weekly_top(
         if position != len(rows):
             lines.append("")
 
-    return "\\n".join(lines)
+    return "\n".join(lines)
 
 
 def is_weekly_report_completed(
