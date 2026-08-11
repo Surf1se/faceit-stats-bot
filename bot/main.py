@@ -3,7 +3,9 @@ import logging
 import os
 import sqlite3
 import time
+from datetime import datetime, timedelta, time as datetime_time
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
@@ -68,6 +70,7 @@ logging.basicConfig(
 
 logger = logging.getLogger("faceit-bot")
 router = Router()
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 waiting_for_nickname: set[int] = set()
 
@@ -150,6 +153,30 @@ def init_database() -> None:
             ON session_results (
                 elo_change DESC,
                 session_ended_at DESC
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS weekly_report_runs (
+                week_start TEXT PRIMARY KEY,
+                completed_at INTEGER NOT NULL
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS weekly_report_deliveries (
+                week_start TEXT NOT NULL,
+                telegram_id INTEGER NOT NULL,
+                attempted_at INTEGER NOT NULL,
+                success INTEGER NOT NULL,
+                PRIMARY KEY (
+                    week_start,
+                    telegram_id
+                )
             )
             """
         )
@@ -387,7 +414,7 @@ def save_session_result(
         connection.commit()
 
 
-def get_leaderboard(
+def get_top_sessions(
     limit: int = 10,
 ) -> list[tuple[str, int, int]]:
     """
@@ -450,18 +477,18 @@ def match_word(count: int) -> str:
     return "матчей"
 
 
-def format_leaderboard(
+def format_top_sessions(
     rows: list[tuple[str, int, int]],
 ) -> str:
     if not rows:
         return (
-            "🏆 Лидерборд лучших сессий\n\n"
+            "🏆 Топ лучших сессий\n\n"
             "Пока нет сессий с положительным "
             "изменением ELO."
         )
 
     medals = ["🥇", "🥈", "🥉"]
-    lines = ["🏆 Лидерборд лучших сессий", ""]
+    lines = ["🏆 Топ лучших сессий", ""]
 
     for position, (nickname, elo_change, match_count) in enumerate(
         rows,
@@ -484,6 +511,259 @@ def format_leaderboard(
 
     return "\n".join(lines)
 
+
+
+def get_week_start(
+    value: datetime | None = None,
+) -> datetime:
+    """Возвращает понедельник 00:00 по Москве."""
+    current = (
+        value.astimezone(MOSCOW_TZ)
+        if value is not None
+        else datetime.now(MOSCOW_TZ)
+    )
+
+    monday_date = (
+        current.date()
+        - timedelta(days=current.weekday())
+    )
+
+    return datetime.combine(
+        monday_date,
+        datetime_time.min,
+        tzinfo=MOSCOW_TZ,
+    )
+
+
+def get_elo_before(
+    telegram_id: int,
+    boundary: datetime,
+) -> int | None:
+    """
+    Возвращает последнее известное ELO после матча,
+    завершённого до указанной границы.
+    """
+    boundary_timestamp = int(
+        boundary.astimezone(MOSCOW_TZ).timestamp()
+    )
+
+    with open_database() as connection:
+        row = connection.execute(
+            """
+            SELECT elo
+            FROM elo_snapshots
+            WHERE telegram_id = ?
+              AND match_finished_at < ?
+            ORDER BY match_finished_at DESC
+            LIMIT 1
+            """,
+            (
+                telegram_id,
+                boundary_timestamp,
+            ),
+        ).fetchone()
+
+    return int(row["elo"]) if row else None
+
+
+def get_weekly_top(
+    week_start: datetime,
+    limit: int = 10,
+) -> list[tuple[str, int]]:
+    """
+    Считает прирост ELO от понедельника 00:00 МСК
+    до конца недели. Для текущей недели берётся
+    последнее сохранённое ELO.
+    """
+    week_start = week_start.astimezone(MOSCOW_TZ)
+    week_end = week_start + timedelta(days=7)
+
+    results: list[tuple[str, int]] = []
+
+    for telegram_id, nickname in get_all_users():
+        start_elo = get_elo_before(
+            telegram_id,
+            week_start,
+        )
+        end_elo = get_elo_before(
+            telegram_id,
+            week_end,
+        )
+
+        if start_elo is None or end_elo is None:
+            continue
+
+        results.append(
+            (
+                nickname,
+                end_elo - start_elo,
+            )
+        )
+
+    results.sort(
+        key=lambda row: (
+            -row[1],
+            row[0].casefold(),
+        )
+    )
+
+    return results[:limit]
+
+
+def format_weekly_top(
+    rows: list[tuple[str, int]],
+    week_start: datetime,
+) -> str:
+    week_start = week_start.astimezone(MOSCOW_TZ)
+    week_last_day = week_start + timedelta(days=6)
+
+    lines = [
+        "🏆 Топ прироста ELO за неделю",
+        (
+            f"{week_start.strftime('%d.%m')} - "
+            f"{week_last_day.strftime('%d.%m')}"
+        ),
+        "",
+    ]
+
+    if not rows:
+        lines.append(
+            "Пока недостаточно данных для расчёта рейтинга."
+        )
+        return "\\n".join(lines)
+
+    medals = ["🥇", "🥈", "🥉"]
+
+    for position, (nickname, elo_change) in enumerate(
+        rows,
+        start=1,
+    ):
+        place = (
+            medals[position - 1]
+            if position <= len(medals)
+            else f"{position}."
+        )
+
+        if elo_change > 0:
+            marker = "🟢"
+            prefix = "+"
+        elif elo_change < 0:
+            marker = "🔴"
+            prefix = ""
+        else:
+            marker = "⚪"
+            prefix = ""
+
+        lines.append(f"{place} {nickname}")
+        lines.append(
+            f"{prefix}{elo_change} ELO {marker}"
+        )
+
+        if position != len(rows):
+            lines.append("")
+
+    return "\\n".join(lines)
+
+
+def is_weekly_report_completed(
+    week_start: datetime,
+) -> bool:
+    week_key = week_start.date().isoformat()
+
+    with open_database() as connection:
+        row = connection.execute(
+            """
+            SELECT 1
+            FROM weekly_report_runs
+            WHERE week_start = ?
+            """,
+            (week_key,),
+        ).fetchone()
+
+    return row is not None
+
+
+def has_weekly_report_attempt(
+    week_start: datetime,
+    telegram_id: int,
+) -> bool:
+    week_key = week_start.date().isoformat()
+
+    with open_database() as connection:
+        row = connection.execute(
+            """
+            SELECT 1
+            FROM weekly_report_deliveries
+            WHERE week_start = ?
+              AND telegram_id = ?
+            """,
+            (
+                week_key,
+                telegram_id,
+            ),
+        ).fetchone()
+
+    return row is not None
+
+
+def mark_weekly_report_attempt(
+    week_start: datetime,
+    telegram_id: int,
+    success: bool,
+) -> None:
+    week_key = week_start.date().isoformat()
+
+    with open_database() as connection:
+        connection.execute(
+            """
+            INSERT INTO weekly_report_deliveries (
+                week_start,
+                telegram_id,
+                attempted_at,
+                success
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(
+                week_start,
+                telegram_id
+            )
+            DO UPDATE SET
+                attempted_at = excluded.attempted_at,
+                success = excluded.success
+            """,
+            (
+                week_key,
+                telegram_id,
+                int(time.time()),
+                1 if success else 0,
+            ),
+        )
+        connection.commit()
+
+
+def mark_weekly_report_completed(
+    week_start: datetime,
+) -> None:
+    week_key = week_start.date().isoformat()
+
+    with open_database() as connection:
+        connection.execute(
+            """
+            INSERT INTO weekly_report_runs (
+                week_start,
+                completed_at
+            )
+            VALUES (?, ?)
+            ON CONFLICT(week_start)
+            DO UPDATE SET
+                completed_at = excluded.completed_at
+            """,
+            (
+                week_key,
+                int(time.time()),
+            ),
+        )
+        connection.commit()
 
 def normalize_nickname(raw_nickname: str) -> str:
     return raw_nickname.strip()
@@ -615,6 +895,129 @@ async def elo_tracking_loop() -> None:
         await asyncio.sleep(sleep_seconds)
 
 
+async def weekly_report_loop(bot: Bot) -> None:
+    """
+    Каждый понедельник в 12:00 по Москве
+    один раз рассылает всем зарегистрированным
+    пользователям итоговый топ за прошлую неделю.
+
+    Если бот был выключен в момент 12:00,
+    отчёт отправится сразу после следующего запуска.
+    """
+    await asyncio.sleep(5)
+
+    while True:
+        now = datetime.now(MOSCOW_TZ)
+        current_week_start = get_week_start(now)
+        scheduled_at = (
+            current_week_start
+            + timedelta(hours=12)
+        )
+
+        if now < scheduled_at:
+            # До сегодняшнего понедельника 12:00
+            # просто ждём точного времени отправки.
+            sleep_seconds = max(
+                1,
+                (scheduled_at - now).total_seconds(),
+            )
+            await asyncio.sleep(sleep_seconds)
+            continue
+
+        report_week_start = (
+            current_week_start
+            - timedelta(days=7)
+        )
+
+        completed = await asyncio.to_thread(
+            is_weekly_report_completed,
+            report_week_start,
+        )
+
+        if not completed:
+            rows = await asyncio.to_thread(
+                get_weekly_top,
+                report_week_start,
+                10,
+            )
+            report_text = format_weekly_top(
+                rows,
+                report_week_start,
+            )
+            users = await asyncio.to_thread(
+                get_all_users
+            )
+
+            logger.info(
+                "Рассылка недельного топа за %s. "
+                "Получателей: %s",
+                report_week_start.date().isoformat(),
+                len(users),
+            )
+
+            for telegram_id, nickname in users:
+                already_attempted = await asyncio.to_thread(
+                    has_weekly_report_attempt,
+                    report_week_start,
+                    telegram_id,
+                )
+
+                if already_attempted:
+                    continue
+
+                success = False
+
+                try:
+                    await bot.send_message(
+                        chat_id=telegram_id,
+                        text=report_text,
+                    )
+                    success = True
+                except Exception as error:
+                    logger.warning(
+                        "Не удалось отправить недельный "
+                        "топ пользователю %s (%s): %s",
+                        telegram_id,
+                        nickname,
+                        limit_error_text(
+                            str(error),
+                            300,
+                        ),
+                    )
+
+                await asyncio.to_thread(
+                    mark_weekly_report_attempt,
+                    report_week_start,
+                    telegram_id,
+                    success,
+                )
+
+                await asyncio.sleep(0.1)
+
+            await asyncio.to_thread(
+                mark_weekly_report_completed,
+                report_week_start,
+            )
+
+            logger.info(
+                "Недельная рассылка за %s завершена.",
+                report_week_start.date().isoformat(),
+            )
+
+        # После отправки/проверки ждём следующего
+        # понедельника ровно до 12:00 по Москве.
+        next_scheduled_at = (
+            current_week_start
+            + timedelta(days=7, hours=12)
+        )
+        now_after_work = datetime.now(MOSCOW_TZ)
+        sleep_seconds = max(
+            1,
+            (next_scheduled_at - now_after_work).total_seconds(),
+        )
+        await asyncio.sleep(sleep_seconds)
+
+
 @router.message(CommandStart())
 async def start_handler(message: Message) -> None:
     if message.from_user is None:
@@ -639,7 +1042,8 @@ async def commands_handler(message: Message) -> None:
     await message.answer(
         "📋 Команды бота\n\n"
         "/stats — статистика последней игровой сессии\n"
-        "/leaderboard — лидерборд лучших сессий\n"
+        "/top_session — топ лучших сессий по приросту ELO\n"
+        "/top_week — топ прироста ELO за текущую неделю\n"
         "/start — указать или изменить FACEIT-ник\n"
         "/commands — список команд"
     )
@@ -714,15 +1118,33 @@ async def stats_handler(message: Message) -> None:
         await status_message.edit_text(output)
 
 
-@router.message(Command("leaderboard"))
-async def leaderboard_handler(message: Message) -> None:
+@router.message(Command("top_session"))
+async def top_session_handler(message: Message) -> None:
     rows = await asyncio.to_thread(
-        get_leaderboard,
+        get_top_sessions,
         10,
     )
 
     await message.answer(
-        format_leaderboard(rows)
+        format_top_sessions(rows)
+    )
+
+
+@router.message(Command("top_week"))
+async def top_week_handler(message: Message) -> None:
+    week_start = get_week_start()
+
+    rows = await asyncio.to_thread(
+        get_weekly_top,
+        week_start,
+        10,
+    )
+
+    await message.answer(
+        format_weekly_top(
+            rows,
+            week_start,
+        )
     )
 
 
@@ -799,8 +1221,12 @@ async def main() -> None:
                 description="Статистика последней сессии",
             ),
             BotCommand(
-                command="leaderboard",
-                description="Топ-10 лучших сессий по ELO",
+                command="top_session",
+                description="Топ лучших сессий",
+            ),
+            BotCommand(
+                command="top_week",
+                description="Топ прироста ELO за неделю",
             ),
             BotCommand(
                 command="commands",
@@ -812,16 +1238,24 @@ async def main() -> None:
     tracking_task = asyncio.create_task(
         elo_tracking_loop()
     )
+    weekly_report_task = asyncio.create_task(
+        weekly_report_loop(bot)
+    )
 
     try:
         await dispatcher.start_polling(bot)
     finally:
         tracking_task.cancel()
+        weekly_report_task.cancel()
 
-        try:
-            await tracking_task
-        except asyncio.CancelledError:
-            pass
+        for task in (
+            tracking_task,
+            weekly_report_task,
+        ):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 if __name__ == "__main__":
