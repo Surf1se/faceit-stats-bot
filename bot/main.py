@@ -630,7 +630,7 @@ def format_weekly_top(
         lines.append(
             "Пока недостаточно данных для расчёта рейтинга."
         )
-        return "\\n".join(lines)
+        return "\n".join(lines)
 
     medals = ["🥇", "🥈", "🥉"]
 
